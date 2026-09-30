@@ -1,0 +1,2 @@
+import {env} from 'cloudflare:workers';import {owner,failure} from '@/lib/server';
+export async function GET(_:Request,{params}:{params:Promise<{key:string}>}){try{const uid=await owner();const file=await env.BUCKET?.get((await params).key);if(!file||file.customMetadata?.owner!==uid)return new Response('Not found',{status:404});return new Response(file.body,{headers:{'Content-Type':file.httpMetadata?.contentType||'image/png','Cache-Control':'private, max-age=3600'}});}catch(e){return failure(e)}}

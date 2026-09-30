@@ -1,0 +1,71 @@
+import {createRequire} from 'node:module';
+import {readFileSync,readdirSync} from 'node:fs';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+const require=createRequire(import.meta.url);
+const wranglerRequire=createRequire(require.resolve('wrangler/package.json'));
+const {Miniflare}=wranglerRequire('miniflare');
+const mf=new Miniflare({modules:[{type:'ESModule',path:path.resolve('dist/server/index.js')},...readdirSync('dist/server',{recursive:true}).filter(f=>/\.m?js$/.test(f)&&f!=='index.js').map(f=>({type:'ESModule',path:path.resolve('dist/server',f)}))],modulesRoot:path.resolve('dist/server'),modulesRules:[{type:'ESModule',include:['**/*.js','**/*.mjs'],fallthrough:true}],compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET']});
+try {
+ const frameResponse=await mf.dispatchFetch('http://demo.local/');
+ assert.equal(frameResponse.status,200);
+ const frameHtml=await frameResponse.text();
+ assert(frameHtml.includes('phone-app-frame')&&frameHtml.includes('/?screen=1#home'),'outer app is isolated inside the phone viewport');
+ const screenResponse=await mf.dispatchFetch('http://demo.local/?screen=1');
+ const screenHtml=await screenResponse.text();
+ assert.equal(screenResponse.status,200);
+ assert(screenHtml.includes('phone-app')&&!screenHtml.includes('class="phone-app-frame"'),'phone screen does not recursively render another iframe');
+ const db=await mf.getD1Database('DB');
+ const sql=readFileSync('drizzle/0000_windy_susan_delgado.sql','utf8');
+ for(const statement of sql.split('--> statement-breakpoint'))await db.prepare(statement.trim()).run();
+ const headers={'oai-authenticated-user-id':'integration-owner','oai-authenticated-user-email':'demo@example.com','Content-Type':'application/json'};
+ const visitorOne=await mf.dispatchFetch('http://demo.local/api/state');assert.equal(visitorOne.status,200);const cookieOne=visitorOne.headers.get('set-cookie')?.split(';')[0];assert.match(cookieOne,/^gift_demo_session=[0-9a-f-]{36}$/i);const guestHeaders={'Cookie':cookieOne,'Content-Type':'application/json'};
+ const guestInitial=await mf.dispatchFetch('http://demo.local/api/state',{headers:guestHeaders});let guestState=await guestInitial.json();assert.equal(guestState.state.friends.length,6);
+ // A pre-upgrade notebook gets sample history once without losing personal records.
+ const legacy=structuredClone(guestState.state);
+ delete legacy.demoGiftWallVersion;
+ legacy.gifts=legacy.gifts.filter(g=>!g.id.startsWith('demo-wall-v1-'));
+ legacy.friends.push({...legacy.friends[0],id:'custom-friend',name:'自己添加的朋友'});
+ legacy.gifts.push({id:'custom-gift',friendId:'custom-friend',name:'我的真实记录',art:0,direction:'sent',date:'2026-08-01',scene:'感谢',feeling:'请保留'});
+ await db.prepare('INSERT INTO notebooks(owner,data,revision) VALUES (?,?,?)').bind('legacy-owner',JSON.stringify(legacy),3).run();
+ const legacyHeaders={'oai-authenticated-user-id':'legacy-owner','oai-authenticated-user-email':'legacy@example.com','Content-Type':'application/json'};
+ const readLegacy=async()=>await (await mf.dispatchFetch('http://demo.local/api/state',{headers:legacyHeaders})).json();
+ const upgraded=await Promise.all([readLegacy(),readLegacy()]);
+ for(const r of upgraded){
+  assert.equal(r.state.demoGiftWallVersion,1);assert.equal(r.state.gifts.length,legacy.gifts.length+36);
+  assert.equal(r.state.gifts.find(g=>g.id==='custom-gift').feeling,'请保留');
+  assert.equal(r.state.gifts.filter(g=>g.friendId==='custom-friend').length,1);
+  for(const f of r.state.friends.filter(f=>f.id!=='custom-friend'))for(const direction of ['sent','received'])assert(r.state.gifts.filter(g=>g.friendId===f.id&&g.direction===direction).length>=3);
+ }
+ const sampleId=upgraded[0].state.gifts.find(g=>g.id.startsWith('demo-wall-v1-')).id;
+ const deleted=await mf.dispatchFetch('http://demo.local/api/state',{method:'POST',headers:legacyHeaders,body:JSON.stringify({action:'deleteGift',payload:{id:sampleId}})});assert.equal(deleted.status,200);
+ const afterDelete=await readLegacy();assert(!afterDelete.state.gifts.some(g=>g.id===sampleId));assert.equal(afterDelete.state.gifts.length,legacy.gifts.length+35);
+ const guestGift={friendId:'f1',name:'独立访客礼物',art:0,direction:'sent',date:'2026-09-29',scene:'生日',feeling:'只在这个访客的手账里'};const guestWrite=await mf.dispatchFetch('http://demo.local/api/state',{method:'POST',headers:guestHeaders,body:JSON.stringify({action:'gift',payload:guestGift})});assert.equal(guestWrite.status,200);
+ const visitorTwo=await mf.dispatchFetch('http://demo.local/api/state');const cookieTwo=visitorTwo.headers.get('set-cookie')?.split(';')[0];assert.notEqual(cookieOne,cookieTwo);const otherGuest=await mf.dispatchFetch('http://demo.local/api/state',{headers:{'Cookie':cookieTwo}});const otherState=await otherGuest.json();assert(!otherState.state.gifts.some(g=>g.name==='独立访客礼物'));
+ const noSessionPost=await mf.dispatchFetch('http://demo.local/api/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'me',payload:{name:'visitor'}})});assert.equal(noSessionPost.status,401);
+ async function request(url,body,auth=true){const r=await mf.dispatchFetch('http://demo.local'+url,{method:body?'POST':'GET',headers:auth?headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});const d=await r.json();return {status:r.status,...d};}
+ let s=await request('/api/state');assert.equal(s.state.friends.length,6);const giftsBefore=s.state.gifts.length;
+ const gift={friendId:'f1',name:'接口验证礼物',art:0,direction:'sent',date:'2026-09-29',scene:'生日',feeling:'成功保存'};
+ let result=await request('/api/state',{action:'gift',payload:gift});assert.equal(result.state.gifts.length,giftsBefore+1);let created=result.state.gifts.find(x=>x.name===gift.name);
+ s=await request('/api/state');assert.equal(s.state.gifts.find(x=>x.id===created.id).feeling,'成功保存');
+ result=await request('/api/state',{action:'gift',payload:{...created,feeling:'编辑后保存'}});assert.equal(result.state.gifts.find(x=>x.id===created.id).feeling,'编辑后保存');
+ await request('/api/state',{action:'note',payload:{friendId:'f1',text:'最近迷上了摄影，想要一台胶片相机'}});
+ s=await request('/api/state');assert(s.state.friends.find(f=>f.id==='f1').tags.includes('摄影'));
+ const profile=s.state.friends.find(f=>f.id==='f1');
+ result=await request('/api/state',{action:'friend',payload:{...profile,anniversaries:[...(profile.anniversaries||[]),{id:'integration-anniversary',date:'2024-10-03',name:'相识纪念日'}]}});
+ assert.deepEqual(result.state.friends.find(f=>f.id==='f1').anniversaries,[{id:'integration-anniversary',date:'2024-10-03',name:'相识纪念日'}]);
+ s=await request('/api/state');assert.equal(s.state.friends.find(f=>f.id==='f1').anniversaries[0].name,'相识纪念日','纪念日保存后重新读取仍存在');
+ const invalidAnniversary=await request('/api/state',{action:'friend',payload:{...s.state.friends.find(f=>f.id==='f1'),anniversaries:[{id:'bad',date:'',name:'   '}]}});assert.equal(invalidAnniversary.status,400);
+ const share=await request('/api/state',{action:'survey',payload:{friendId:'f1',kind:'personality'}});assert(share.token);
+ const survey=await request('/api/survey/'+share.token,undefined,false);assert.equal(survey.questions.length,8);
+ const returned=await request('/api/survey/'+share.token,{answers:[0,1,0,1,0,1,0,1]},false);assert.equal(returned.ok,true);
+ s=await request('/api/state');assert.equal(s.state.friends.find(f=>f.id==='f1').personalities.length,1);
+ const duplicate=await request('/api/survey/'+share.token,{answers:[0,1,0,1,0,1,0,1]},false);assert.equal(duplicate.status,400);
+ const invalid=await request('/api/state',{action:'gift',payload:{...gift,art:99}});assert.equal(invalid.status,400);
+ const fileForm=new FormData();fileForm.append('file',new File([new Uint8Array([137,80,78,71])],'test.png',{type:'image/png'}));
+ const multipart=new Request('http://demo.local/api/upload',{method:'POST',body:fileForm});const upload=await mf.dispatchFetch(multipart.url,{method:'POST',headers:{'oai-authenticated-user-id':'integration-owner','oai-authenticated-user-email':'demo@example.com','Content-Type':multipart.headers.get('content-type')},body:await multipart.arrayBuffer()});const uploaded=await upload.json();assert(uploaded.url,JSON.stringify(uploaded));
+ const media=await mf.dispatchFetch('http://demo.local'+uploaded.url,{headers});assert.equal(media.status,200);
+ const other=await mf.dispatchFetch('http://demo.local'+uploaded.url,{headers:{'oai-authenticated-user-id':'other','oai-authenticated-user-email':'other@example.com'}});assert.equal(other.status,404);
+ result=await request('/api/state',{action:'deleteGift',payload:{id:created.id}});assert.equal(result.state.gifts.length,giftsBefore);
+ console.log('PASS: guest session isolation, persistence, birthday/anniversary profile persistence and validation, gift create/edit/delete, note summary, anonymous survey return, duplicate prevention, authorization, validation, image storage and access isolation.');
+}finally{await mf.dispose();}

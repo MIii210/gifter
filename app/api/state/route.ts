@@ -1,0 +1,17 @@
+import { owner,read,save,failure,database,guestCookie,newGuestCookie } from '@/lib/server';
+import { headers } from 'next/headers';
+import { id,summarize,today } from '@/lib/model';
+import { z } from 'zod';
+const anniversarySchema=z.object({id:z.string().min(1),date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),name:z.string().trim().min(1,'请填写纪念日名称').max(40)});
+const friendSchema=z.object({id:z.string().optional(),name:z.string().trim().min(1).max(24),avatar:z.number().int().min(0).max(5),birthday:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),relation:z.enum(['朋友','伴侣','家人','师长','同事']),mbti:z.string().max(16),anniversaries:z.array(anniversarySchema).max(20).optional()});
+const giftSchema=z.object({id:z.string().optional(),friendId:z.string(),name:z.string().trim().min(1).max(60),art:z.number().int().min(0).max(15),direction:z.enum(['sent','received']),date:z.string().regex(/^\d{4}-\d{2}-\d{2}$/),scene:z.string().min(1).max(20),feeling:z.string().max(1000)});
+export async function GET(){try{const requestHeaders=await headers();if(!guestCookie(requestHeaders)&&(!requestHeaders.get('oai-authenticated-user-id')||!requestHeaders.get('oai-authenticated-user-email'))){const cookie=newGuestCookie();const token=cookie.split('=')[1].split(';')[0];const data=await read(`guest:${token}`);return Response.json(data,{headers:{'Set-Cookie':cookie,'Cache-Control':'private, no-store','Vary':'Cookie'}});}return Response.json(await read(await owner()),{headers:{'Cache-Control':'private, no-store','Vary':'Cookie'}});}catch(e){return failure(e)}}
+export async function POST(req:Request){try{const uid=await owner();const body:any=await req.json();const {state,revision}=await read(uid);const a=body.action;const p=body.payload;
+if(a==='friend'){const v=friendSchema.parse(p);const old=state.friends.find(f=>f.id===v.id);const anniversaries=v.anniversaries??old?.anniversaries??[];if(old)Object.assign(old,{...v,anniversaries});else state.friends.push({...v,anniversaries,id:id(),tags:[],personalities:[]});}
+else if(a==='note'){const v=z.object({friendId:z.string(),text:z.string().trim().min(1).max(3000),image:z.string().optional()}).parse(p);const f=state.friends.find(f=>f.id===v.friendId);if(!f)throw Error('朋友不存在');state.notes.unshift({...v,id:id(),date:today(),source:'日常记录'});f.tags=[...new Set([...f.tags,...summarize(v.text)])].slice(-8);}
+else if(a==='gift'){const v=giftSchema.parse(p);if(!state.friends.some(f=>f.id===v.friendId))throw Error('朋友不存在');const old=state.gifts.find(g=>g.id===v.id);if(old)Object.assign(old,v);else state.gifts.unshift({...v,id:id()});}
+else if(a==='deleteGift'){state.gifts=state.gifts.filter(g=>g.id!==p.id);}
+else if(a==='favorite'){const pid=z.string().regex(/^p\d+$/).parse(p.id);state.favorites=state.favorites.includes(pid)?state.favorites.filter(x=>x!==pid):[...state.favorites,pid];}
+else if(a==='me'){state.me={...state.me,...z.object({name:z.string().trim().min(1).max(24)}).parse(p)};}
+else if(a==='survey'){const v=z.object({friendId:z.string(),kind:z.enum(['personality','preference'])}).parse(p);if(!state.friends.some(f=>f.id===v.friendId))throw Error('朋友不存在');const token=id()+id().slice(0,8);await database().prepare('INSERT INTO surveys(token,owner,friend_id,kind,created) VALUES (?,?,?,?,?)').bind(token,uid,v.friendId,v.kind,new Date().toISOString()).run();return Response.json({token});}
+else throw Error('不支持的操作');await save(uid,state,revision);return Response.json({state,revision:revision+1});}catch(e){return failure(e)}}
